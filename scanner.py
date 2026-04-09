@@ -1,8 +1,9 @@
 import os
 import re
 import requests
+import concurrent.futures
 from git import Repo
-from tqdm import tqdm
+from threading import Lock
 
 TOKEN = os.getenv("GITHUB_TOKEN")
 TARGET_TYPE = os.getenv("TARGET_TYPE")
@@ -15,7 +16,9 @@ INCLUDE_MEMBERS = os.getenv("INCLUDE_MEMBERS") == "true"
 HEADERS = {"Authorization": f"token {TOKEN}"}
 
 WORKDIR = "repos"
-TOTAL_FINDINGS = 0
+
+print_lock = Lock()
+global_findings = 0
 
 
 ####################################
@@ -33,47 +36,41 @@ SECRET_PATTERNS = {
     "GOOGLE_API_KEY": r"AIza[0-9A-Za-z\-_]{35}",
     "STRIPE_SECRET": r"sk_live_[0-9a-zA-Z]{24}",
     "JWT_TOKEN": r"eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+",
-
-    "PASSWORD":
-        r"(?i)(password|passwd|pwd)\s*[:=]\s*['\"].+?['\"]",
-
-    "SECRET":
-        r"(?i)secret\s*[:=]\s*['\"].+?['\"]",
-
-    "TOKEN":
-        r"(?i)token\s*[:=]\s*['\"].+?['\"]",
-
-    "DATABASE_URL":
-        r"(postgres|mysql|mongodb|redis):\/\/[^ ]+",
-
-    "SLACK_WEBHOOK":
-        r"https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9\/]+",
-
-    "DISCORD_WEBHOOK":
-        r"https:\/\/discord\.com\/api\/webhooks\/[A-Za-z0-9\/]+",
-
-    "BASIC_AUTH_URL":
-        r"https?:\/\/[^:\s]+:[^@\s]+@[^@\s]+",
+    "PASSWORD": r"(?i)(password|passwd|pwd)\s*[:=]\s*['\"].+?['\"]",
+    "SECRET": r"(?i)secret\s*[:=]\s*['\"].+?['\"]",
+    "TOKEN": r"(?i)token\s*[:=]\s*['\"].+?['\"]",
+    "DATABASE_URL": r"(postgres|mysql|mongodb|redis):\/\/[^ ]+",
+    "SLACK_WEBHOOK": r"https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9\/]+",
+    "DISCORD_WEBHOOK": r"https:\/\/discord\.com\/api\/webhooks\/[A-Za-z0-9\/]+",
+    "BASIC_AUTH_URL": r"https?:\/\/[^:\s]+:[^@\s]+@[^@\s]+",
 
 }
 
 
 ####################################
-# LOG OUTPUT FORMATTER
+# PRINT HELPERS
 ####################################
+
+def safe_print(msg):
+
+    with print_lock:
+        print(msg)
+
 
 def print_finding(repo, branch, file, match_type, match):
 
-    global TOTAL_FINDINGS
-    TOTAL_FINDINGS += 1
+    global global_findings
+    global_findings += 1
 
-    print("\n🚨 SECRET FOUND")
-    print(f"Repo: {repo}")
-    print(f"Branch: {branch}")
-    print(f"File: {file}")
-    print(f"Type: {match_type}")
-    print(f"Match: {match[:120]}")
-    print("-" * 60)
+    safe_print(f"""
+🚨 SECRET FOUND
+Repo: {repo}
+Branch: {branch}
+File: {file}
+Type: {match_type}
+Match: {match[:120]}
+------------------------------------------------------------
+""")
 
 
 ####################################
@@ -90,67 +87,43 @@ def github_api(url):
     return r.json()
 
 
-def get_org_repos(org):
+def paginate(url):
 
-    repos = []
+    results = []
     page = 1
 
     while True:
 
-        url = f"https://api.github.com/orgs/{org}/repos?page={page}"
-
-        data = github_api(url)
+        data = github_api(f"{url}?page={page}")
 
         if not data:
             break
 
-        repos.extend([repo["clone_url"] for repo in data])
-
+        results.extend(data)
         page += 1
 
-    return repos
+    return results
+
+
+def get_org_repos(org):
+
+    data = paginate(f"https://api.github.com/orgs/{org}/repos")
+
+    return [repo["clone_url"] for repo in data]
 
 
 def get_user_repos(user):
 
-    repos = []
-    page = 1
+    data = paginate(f"https://api.github.com/users/{user}/repos")
 
-    while True:
-
-        url = f"https://api.github.com/users/{user}/repos?page={page}"
-
-        data = github_api(url)
-
-        if not data:
-            break
-
-        repos.extend([repo["clone_url"] for repo in data])
-
-        page += 1
-
-    return repos
+    return [repo["clone_url"] for repo in data]
 
 
 def get_org_members(org):
 
-    members = []
-    page = 1
+    data = paginate(f"https://api.github.com/orgs/{org}/members")
 
-    while True:
-
-        url = f"https://api.github.com/orgs/{org}/members?page={page}"
-
-        data = github_api(url)
-
-        if not data:
-            break
-
-        members.extend([member["login"] for member in data])
-
-        page += 1
-
-    return members
+    return [member["login"] for member in data]
 
 
 ####################################
@@ -159,11 +132,15 @@ def get_org_members(org):
 
 def scan_text(text, repo, file, branch):
 
+    matches_found = 0
+
     for name, pattern in SECRET_PATTERNS.items():
 
         matches = re.findall(pattern, text)
 
         for match in matches:
+
+            matches_found += 1
 
             print_finding(
                 repo,
@@ -173,6 +150,62 @@ def scan_text(text, repo, file, branch):
                 match
             )
 
+    return matches_found
+
+
+def scan_branch(repo, repo_name, branch):
+
+    findings = 0
+
+    repo.git.checkout(branch)
+
+    for root, _, files in os.walk(repo.working_tree_dir):
+
+        for file in files:
+
+            path = os.path.join(root, file)
+
+            try:
+
+                with open(path, "r", errors="ignore") as f:
+
+                    findings += scan_text(
+                        f.read(),
+                        repo_name,
+                        path,
+                        branch.name
+                    )
+
+            except:
+                pass
+
+    if SCAN_HISTORY:
+
+        for commit in repo.iter_commits(branch.name):
+
+            for file in commit.stats.files:
+
+                try:
+
+                    blob = commit.tree / file
+
+                    content = blob.data_stream.read().decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+
+                    findings += scan_text(
+                        content,
+                        repo_name,
+                        file,
+                        branch.name
+                    )
+
+                except:
+                    pass
+
+    return findings
+
 
 def scan_repo(repo_url):
 
@@ -180,64 +213,51 @@ def scan_repo(repo_url):
 
     repo_path = f"{WORKDIR}/{repo_name}"
 
-    print(f"\n🔍 Scanning repo: {repo_name}")
+    safe_print(f"\n🔍 START repo: {repo_name}")
 
-    repo = Repo.clone_from(repo_url, repo_path)
+    try:
+
+        repo = Repo.clone_from(
+            repo_url,
+            repo_path,
+            depth=None if SCAN_HISTORY else 1
+        )
+
+    except Exception as e:
+
+        safe_print(f"❌ clone failed: {repo_name}")
+        return 0
 
     branches = repo.branches if SCAN_BRANCHES else [repo.active_branch]
 
-    for branch in branches:
+    repo_findings = 0
 
-        print(f"📂 Branch: {branch}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
 
-        repo.git.checkout(branch)
+        futures = []
 
-        for root, _, files in os.walk(repo_path):
+        for branch in branches:
 
-            for file in files:
+            futures.append(
+                executor.submit(
+                    scan_branch,
+                    repo,
+                    repo_name,
+                    branch
+                )
+            )
 
-                path = os.path.join(root, file)
+        for future in concurrent.futures.as_completed(futures):
 
-                try:
+            repo_findings += future.result()
 
-                    with open(path, "r", errors="ignore") as f:
+    safe_print(f"""
+✅ FINISHED repo: {repo_name}
+Secrets found: {repo_findings}
+========================================
+""")
 
-                        scan_text(
-                            f.read(),
-                            repo_name,
-                            path,
-                            branch.name
-                        )
-
-                except:
-                    pass
-
-        if SCAN_HISTORY:
-
-            print("🕘 Scanning commit history...")
-
-            for commit in repo.iter_commits(branch.name):
-
-                for file in commit.stats.files:
-
-                    try:
-
-                        blob = commit.tree / file
-
-                        content = blob.data_stream.read().decode(
-                            "utf-8",
-                            errors="ignore"
-                        )
-
-                        scan_text(
-                            content,
-                            repo_name,
-                            file,
-                            branch.name
-                        )
-
-                    except:
-                        pass
+    return repo_findings
 
 
 ####################################
@@ -274,20 +294,19 @@ def main():
 
             repos.extend(get_user_repos(TARGET_NAME))
 
-    print(f"\n🚀 Starting scan across {len(repos)} repositories\n")
+    safe_print(f"\n🚀 Parallel scan starting ({len(repos)} repos)\n")
 
-    for repo in tqdm(repos):
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, len(repos))
+    ) as executor:
 
-        try:
+        results = executor.map(scan_repo, repos)
 
-            scan_repo(repo)
+    safe_print(f"""
+🎯 ORG SCAN COMPLETE
+Total secrets detected: {global_findings}
+""")
 
-        except Exception as e:
-
-            print(f"⚠️ Error scanning {repo}: {e}")
-
-    print("\n✅ Scan complete")
-    print(f"🔎 Total findings: {TOTAL_FINDINGS}")
 
 
 if __name__ == "__main__":
