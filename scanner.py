@@ -34,6 +34,36 @@ printed_secrets = set()
 # ENTROPY DETECTOR
 ####################################
 
+CONTEXT_KEYWORDS = {
+
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "authorization",
+    "bearer",
+    "access_key",
+    "private_key",
+    "client_secret",
+    "jwt",
+}
+
+
+IGNORED_CONTEXT = {
+
+    "commit/",
+    "checksum",
+    "sha1",
+    "sha256",
+    "integrity",
+    "node_modules",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+}
+
 def shannon_entropy(data):
 
     if not data:
@@ -50,17 +80,34 @@ def shannon_entropy(data):
     return entropy
 
 
-def looks_like_secret(value):
+def looks_like_secret(token, text):
 
-    if len(value) < 20:
+    if len(token) < 24:
         return False
 
-    if value.lower().startswith("sha"):
+    if token.startswith("sha"):
         return False
 
-    entropy = shannon_entropy(value)
+    if re.fullmatch(r"[a-f0-9]{40}", token):
+        return False
 
-    return entropy >= 4.2
+    if re.fullmatch(r"[a-f0-9]{64}", token):
+        return False
+
+    entropy = shannon_entropy(token)
+
+    if entropy < 4.5:
+        return False
+
+    lower_text = text.lower()
+
+    if not any(keyword in lower_text for keyword in CONTEXT_KEYWORDS):
+        return False
+
+    if any(ignore in lower_text for ignore in IGNORED_CONTEXT):
+        return False
+
+    return True
 
 
 ####################################
@@ -206,7 +253,7 @@ def entropy_scan(text,
 
     for token in matches:
 
-        if not looks_like_secret(token):
+        if not looks_like_secret(token, text):
             continue
 
         print_finding(
