@@ -33,6 +33,141 @@ discovered_users = set()
 
 global_findings = 0
 
+####################################
+# ENTROPY IGNORE FILE FILTER
+####################################
+
+####################################
+# ENTROPY IGNORE FILE FILTER
+####################################
+
+ENTROPY_IGNORE_EXTENSIONS = {
+
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".svg",
+    ".map",
+
+    ".lock",
+    ".sum",
+
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+
+    ".jar",
+    ".class",
+    ".war",
+
+    ".min.js",
+    ".bundle.js",
+
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+
+    ".pdf",
+}
+
+
+ENTROPY_IGNORE_FILENAMES = {
+
+    # Node ecosystem
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+
+    # Go ecosystem
+    "go.sum",
+
+    # Rust
+    "Cargo.lock",
+
+    # Ruby
+    "Gemfile.lock",
+
+    # PHP
+    "composer.lock",
+
+    # CocoaPods
+    "Podfile.lock",
+
+    # Python
+    "poetry.lock",
+    "Pipfile.lock",
+
+    # Java / Gradle
+    "gradle.lockfile",
+
+    # Terraform
+    ".terraform.lock.hcl",
+
+    # Misc dependency hashes
+    "checksum",
+    "checksums.txt",
+    "integrity.json",
+}
+
+
+def skip_entropy_file(file_path):
+
+    filename = os.path.basename(file_path).lower()
+
+    if filename in ENTROPY_IGNORE_FILENAMES:
+        return True
+
+    if filename.endswith(".lock"):
+        return True
+
+    if filename.endswith(".sum"):
+        return True
+
+    if ".min." in filename:
+        return True
+
+    if "checksum" in filename:
+        return True
+
+    if "integrity" in filename:
+        return True
+
+    ext = os.path.splitext(filename)[1]
+
+    if ext in ENTROPY_IGNORE_EXTENSIONS:
+        return True
+
+    return False
+
+ENTROPY_IGNORE_DIRECTORIES = {
+
+    "node_modules",
+    ".git",
+    "dist",
+    "build",
+    "vendor",
+    "target",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".terraform",
+}
+
+
+def skip_entropy_directory(file_path):
+
+    parts = file_path.split("/")
+
+    for part in parts:
+
+        if part in ENTROPY_IGNORE_DIRECTORIES:
+            return True
+
+    return False
 
 ####################################
 # ENTROPY FILTER
@@ -99,6 +234,12 @@ def looks_like_secret(token, text):
         return False
 
     if any(ignore in text_lower for ignore in IGNORED_CONTEXT):
+        return False
+
+    if "integrity" in text_lower:
+        return False
+
+    if "checksum" in text_lower:
         return False
 
     return True
@@ -213,6 +354,12 @@ def entropy_scan(text,
                  branch,
                  commit_hash,
                  file_path):
+
+    if skip_entropy_file(file_path):
+        return 0
+
+    if skip_entropy_directory(file_path):
+        return 0
 
     findings = 0
 
