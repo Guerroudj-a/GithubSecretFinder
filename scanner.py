@@ -19,6 +19,7 @@ REPO_NAME = os.getenv("REPO_NAME")
 
 SCAN_HISTORY = os.getenv("SCAN_HISTORY") == "true"
 SCAN_BRANCHES = os.getenv("SCAN_BRANCHES") == "true"
+INCLUDE_MEMBERS = True
 
 HEADERS = {"Authorization": f"token {TOKEN}"}
 
@@ -26,12 +27,15 @@ WORKDIR = "repos"
 
 print_lock = Lock()
 
-global_findings = 0
 printed_secrets = set()
+scanned_repos = set()
+discovered_users = set()
+
+global_findings = 0
 
 
 ####################################
-# ENTROPY DETECTOR
+# ENTROPY FILTER
 ####################################
 
 CONTEXT_KEYWORDS = {
@@ -39,9 +43,7 @@ CONTEXT_KEYWORDS = {
     "token",
     "secret",
     "password",
-    "passwd",
     "apikey",
-    "api_key",
     "authorization",
     "bearer",
     "access_key",
@@ -61,13 +63,10 @@ IGNORED_CONTEXT = {
     "node_modules",
     "package-lock.json",
     "yarn.lock",
-    "pnpm-lock.yaml",
 }
 
-def shannon_entropy(data):
 
-    if not data:
-        return 0
+def shannon_entropy(data):
 
     entropy = 0
 
@@ -85,33 +84,28 @@ def looks_like_secret(token, text):
     if len(token) < 24:
         return False
 
-    if token.startswith("sha"):
-        return False
-
     if re.fullmatch(r"[a-f0-9]{40}", token):
         return False
 
     if re.fullmatch(r"[a-f0-9]{64}", token):
         return False
 
-    entropy = shannon_entropy(token)
-
-    if entropy < 4.5:
+    if shannon_entropy(token) < 4.5:
         return False
 
-    lower_text = text.lower()
+    text_lower = text.lower()
 
-    if not any(keyword in lower_text for keyword in CONTEXT_KEYWORDS):
+    if not any(k in text_lower for k in CONTEXT_KEYWORDS):
         return False
 
-    if any(ignore in lower_text for ignore in IGNORED_CONTEXT):
+    if any(ignore in text_lower for ignore in IGNORED_CONTEXT):
         return False
 
     return True
 
 
 ####################################
-# HIGH-SIGNAL REGEX PATTERNS
+# SECRET PATTERNS
 ####################################
 
 SECRET_PATTERNS = {
@@ -134,40 +128,9 @@ SECRET_PATTERNS = {
     "DISCORD_WEBHOOK":
         r"(https:\/\/discord\.com\/api\/webhooks\/[A-Za-z0-9\/]+)",
 
-    "API_KEY_ASSIGNMENT":
+    "API_KEY":
         r"(api[_-]?key)\s*[:=]\s*[\"']([A-Za-z0-9\-_]{20,})[\"']",
-
 }
-
-
-####################################
-# FILTERS
-####################################
-
-INVALID_VALUES = {
-
-    "",
-    "example",
-    "changeme",
-    "password",
-    "secret",
-    "null",
-    "none"
-}
-
-
-def is_valid_secret(value):
-
-    if not value:
-        return False
-
-    if value.lower() in INVALID_VALUES:
-        return False
-
-    if len(value) < 12:
-        return False
-
-    return True
 
 
 ####################################
@@ -185,7 +148,7 @@ def already_reported(secret):
 
 
 ####################################
-# OUTPUT
+# SAFE PRINT
 ####################################
 
 def safe_print(msg):
@@ -193,6 +156,10 @@ def safe_print(msg):
     with print_lock:
         print(msg)
 
+
+####################################
+# OUTPUT
+####################################
 
 def print_finding(repo_url,
                   branch,
@@ -235,10 +202,10 @@ Value: {secret_value[:80]}
 
 
 ####################################
-# ENTROPY TOKEN SCANNER
+# ENTROPY SCAN
 ####################################
 
-ENTROPY_REGEX = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
+ENTROPY_REGEX = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
 
 
 def entropy_scan(text,
@@ -291,9 +258,6 @@ def scan_text(text,
             if isinstance(match, tuple):
                 match = match[-1]
 
-            if not is_valid_secret(match):
-                continue
-
             print_finding(
                 repo_url,
                 branch,
@@ -317,7 +281,46 @@ def scan_text(text,
 
 
 ####################################
-# HISTORY SCANNER
+# PEOPLE DISCOVERY
+####################################
+
+def add_user(user):
+
+    if user and user not in discovered_users:
+
+        discovered_users.add(user)
+
+        return True
+
+    return False
+
+
+def get_org_members(org):
+
+    return [
+
+        m["login"]
+
+        for m in paginate(
+            f"https://api.github.com/orgs/{org}/members"
+        )
+    ]
+
+
+def get_repo_contributors(owner, repo):
+
+    return [
+
+        c["login"]
+
+        for c in paginate(
+            f"https://api.github.com/repos/{owner}/{repo}/contributors"
+        )
+    ]
+
+
+####################################
+# COMMIT HISTORY
 ####################################
 
 def scan_commit_history(repo,
@@ -350,13 +353,14 @@ def scan_commit_history(repo,
                 )
 
             except:
+
                 continue
 
     return findings
 
 
 ####################################
-# BRANCH SCANNER
+# BRANCH SCAN
 ####################################
 
 def scan_branch(repo,
@@ -367,14 +371,13 @@ def scan_branch(repo,
 
     repo.git.checkout(branch)
 
-    for root, _, files in os.walk(
-            repo.working_tree_dir):
+    for root, _, files in os.walk(repo.working_tree_dir):
 
         for file in files:
 
             path = os.path.join(root, file)
 
-            relative_path = path.replace(
+            relative = path.replace(
                 repo.working_tree_dir + "/",
                 ""
             )
@@ -390,10 +393,11 @@ def scan_branch(repo,
                         repo_url,
                         branch.name,
                         None,
-                        relative_path
+                        relative
                     )
 
             except:
+
                 continue
 
     if SCAN_HISTORY:
@@ -408,14 +412,19 @@ def scan_branch(repo,
 
 
 ####################################
-# REPO SCANNER
+# REPO SCAN
 ####################################
 
 def scan_repo(repo_url):
 
-    safe_print(
-        f"\n🔍 START repo: {repo_url}"
-    )
+    if repo_url in scanned_repos:
+        return 0
+
+    scanned_repos.add(repo_url)
+
+    safe_print(f"\n🔍 START repo: {repo_url}")
+
+    owner = repo_url.split("github.com/")[1].split("/")[0]
 
     repo_name = repo_url.split("/")[-1].replace(".git", "")
 
@@ -428,18 +437,28 @@ def scan_repo(repo_url):
 
     except:
 
-        safe_print(
-            f"❌ clone failed: {repo_url}"
-        )
+        safe_print(f"❌ clone failed: {repo_url}")
 
         return 0
 
-    branches = repo.branches
+    try:
+
+        contributors = get_repo_contributors(
+            owner,
+            repo_name
+        )
+
+        for contributor in contributors:
+
+            add_user(contributor)
+
+    except:
+
+        pass
 
     repo_findings = 0
 
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
 
         futures = [
 
@@ -450,11 +469,10 @@ def scan_repo(repo_url):
                 branch
             )
 
-            for branch in branches
+            for branch in repo.branches
         ]
 
-        for future in concurrent.futures.as_completed(
-                futures):
+        for future in concurrent.futures.as_completed(futures):
 
             repo_findings += future.result()
 
@@ -468,7 +486,7 @@ Secrets found: {repo_findings}
 
 
 ####################################
-# ENUMERATION
+# GITHUB API HELPERS
 ####################################
 
 def github_api(url):
@@ -506,12 +524,11 @@ def get_org_repos(org):
 
     return [
 
-        repo["clone_url"]
+        r["clone_url"]
 
-        for repo in paginate(
+        for r in paginate(
             f"https://api.github.com/orgs/{org}/repos"
         )
-
     ]
 
 
@@ -519,12 +536,11 @@ def get_user_repos(user):
 
     return [
 
-        repo["clone_url"]
+        r["clone_url"]
 
-        for repo in paginate(
+        for r in paginate(
             f"https://api.github.com/users/{user}/repos"
         )
-
     ]
 
 
@@ -537,49 +553,39 @@ def main():
     os.makedirs(WORKDIR,
                 exist_ok=True)
 
-    repos = []
+    repos = set()
 
-    if REPO_NAME:
+    users = set()
 
-        repos = [
+    if TARGET_TYPE == "org":
 
-            f"https://github.com/{TARGET_NAME}/{REPO_NAME}.git"
+        repos.update(get_org_repos(TARGET_NAME))
 
-        ]
+        members = get_org_members(TARGET_NAME)
 
-    else:
+        users.update(members)
 
-        if TARGET_TYPE == "org":
+    elif TARGET_TYPE == "user":
 
-            repos.extend(
-                get_org_repos(
-                    TARGET_NAME
-                )
-            )
+        users.add(TARGET_NAME)
 
-        elif TARGET_TYPE == "user":
+    for user in users:
 
-            repos.extend(
-                get_user_repos(
-                    TARGET_NAME
-                )
-            )
+        repos.update(get_user_repos(user))
 
     safe_print(
-        f"\n🚀 Entropy-enhanced credential scan starting ({len(repos)} repos)\n"
+        f"\n🚀 Exposure-surface scan starting ({len(repos)} repos)\n"
     )
 
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, len(repos))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
 
-        executor.map(
-            scan_repo,
-            repos
-        )
+        executor.map(scan_repo,
+                     repos)
 
     safe_print(f"""
 🎯 SCAN COMPLETE
 Unique secrets detected: {global_findings}
+Users discovered: {len(discovered_users)}
 """)
 
 
